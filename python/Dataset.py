@@ -9,38 +9,12 @@ from tqdm import tqdm
 
 fs = 44100
 
-def hz2mel(f):
-    return 1127.01048*np.log(f/700.0+1.0)
-def mel2hz(m):
-    return 700*(np.exp(m/1127.01048)-1.0)
-
-def melFilterBank(fs,fmin,fmax,length,numChannels):
-    melmax = hz2mel(fmax)
-    melmin = hz2mel(fmin)
-    nmax = length / 2
-    df = fs / float(length)
-    dmel = (melmax - melmin) / (numChannels + 1.0)
-    melcenters = np.arange(0,numChannels + 2) * dmel + melmin
-    fcenters = mel2hz(melcenters)
-    index = np.round(fcenters/df)
-    indexstart = index[:numChannels].copy()
-    indexcenter = index[1:numChannels+1].copy()
-    indexstop = index[2:].copy()
-    filterbank = np.zeros((numChannels,int(nmax)))
-    for c in range(numChannels):
-        increment = 1.0 / (indexcenter[c] - indexstart[c])
-        for i in np.arange(indexstart[c],indexcenter[c]):
-            filterbank[int(c),int(i)] = (i-indexstart[c]) * increment
-        decrement = 1.0 / (indexstop[c] - indexcenter[c])
-        for i in np.arange(indexcenter[c],indexstop[c]):
-            filterbank[int(c),int(i)] = 1.0 - ((i - indexcenter[c]) * decrement)
-    return filterbank,fcenters[1:numChannels+1]
-
 def generate_data(filename,mels,ffts,shift,n,time):
-    filterbank,fc = melFilterBank(fs,0,fs/2,ffts,mels)
     suffix = ['','_noise','_stretch0','_stretch1','_stretch2','_stretch3']
     l = 8820
     data = np.array([])
+    frequency = np.zeros(ffts//2)
+    window = np.hamming(ffts)
     for s in suffix:
         wave,rate = sf.read('../augmentation/'+filename+s+'.wav')
         # extraction
@@ -66,40 +40,33 @@ def generate_data(filename,mels,ffts,shift,n,time):
                 else:
                     break
         index = np.array(index,dtype=int)
-        # zero padding
+        # zero padding and characteristic frequency extraction
         waves = []
-        zerolen = int((time)*shift*fs/1000.)
+        zerolen = int(time*shift*fs/1000.)
         for i in index:
             waves.append(np.append(np.append(np.zeros(zerolen//2),wave[i[0]:i[1]]),np.zeros(zerolen//2)))
+            if s != '':
+                continue
+            spectrum = []
+            for t in np.arange(int((waves[-1].shape[0]-ffts)/(shift*fs/1000.))):
+                spec = np.fft.fft(window*waves[-1][int(t*shift*fs/1000.):int(t*shift*fs/1000.)+ffts])[:ffts//2]
+                spectrum.append(np.abs(spec))
+            spectrum = np.array(spectrum)
+            spectrum = np.sum(spectrum,axis=0)
+            frequency += spectrum > np.max(spectrum)*0.1
         # generate dataset
         indexs = np.random.choice(np.arange(index.shape[0]),n,replace=True)
         d = []
         for i in indexs:
             sidx = np.random.choice(np.arange(waves[i].shape[0]-zerolen-1-ffts),1)[0]
-            if sidx < ffts:
-                w = np.append(np.zeros(ffts-sidx),waves[i])
-            else:
-                w = waves[i][sidx:]
-            mel = []
-            delta = []
-            for t in np.arange(time):
-                s1 = np.fft.fft(w[int(t*shift*fs/1000.):int(t*shift*fs/1000.)+ffts])
-                s2 = np.fft.fft(w[int((t+1)*shift*fs/1000.):int((t+1)*shift*fs/1000.)+ffts])
-                m1 = np.log10(np.dot(filterbank, np.abs(s1[:ffts//2])+np.ones(ffts//2)*10**(-16)))
-                m2 = np.log10(np.dot(filterbank, np.abs(s2[:ffts//2])+np.ones(ffts//2)*10**(-16)))
-                mel.append(m2)
-                delta.append(m2-m1)
-            mel = np.array(mel)
-            delta = np.array(delta)
-            mel = mel/np.linalg.norm(mel)
-            delta = delta/np.linalg.norm(delta)
-            d.append(np.array([mel,delta]))
+            w = waves[i][sidx:sidx+int(time*shift*fs/1000.)+ffts]
+            d.append(w)
         d = np.array(d)
         if data.shape[0] == 0:
             data = d
         else:
             data = np.concatenate([data,d])
-    return data
+    return data, frequency>0
 
 def main():
     parser = argparse.ArgumentParser(description='Dataset')
@@ -120,21 +87,27 @@ def main():
         meta = meta.sort_values('target').reset_index(drop=True)
         dataset = np.array([])
         label = np.array([])
+        frequency = {}
         bar = tqdm(range(meta.shape[0]))
         for i in bar:
             m = meta.loc[i]
             filename = m['filename'][:-4]
             bar.set_description('Processing {}'.format(filename))
-            data = generate_data(filename,args.mels,args.ffts,args.shift,args.n_data,args.time) # shape(n_data*6,2,mels,time)
+            data, frequency_ = generate_data(filename,args.mels,args.ffts,args.shift,args.n_data,args.time) # shape(n_data*6,wave_length), (ffts//2,)
             label_ = np.full(data.shape[0],m['target'])
             if dataset.shape[0] == 0:
                 dataset = data
                 label = label_
             else:
-                dataset = np.concatenate([dataset,data]) # shape (dataset_size, 2, mels, time)
+                dataset = np.concatenate([dataset,data]) # shape (dataset_size, wave_length)
                 label = np.concatenate([label,label_])
+            if m['target'] in frequency:
+                frequency[m['target']] += frequency_
+            else:
+                frequency[m['target']] = frequency_
         np.save(datasetpath+'fold{}dataset'.format(f),dataset)
         np.save(datasetpath+'fold{}label'.format(f),label)
+        np.save(datasetpath+'fold{}frequency'.format(f),frequency) # np.load(~,allow_pickle=True).item()
 
 if __name__ == '__main__':
     main()
